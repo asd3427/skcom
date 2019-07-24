@@ -4,7 +4,6 @@ quicksk.receiver
 
 from datetime import datetime, timedelta
 import json
-import logging
 import math
 import os
 import os.path
@@ -16,6 +15,10 @@ import pythoncom
 from comtypes import COMError
 import comtypes.client
 import comtypes.gen.SKCOMLib as sk
+from comtypes.client import GetModule, CreateObject, GetEvents
+
+if 'skR' not in globals(): skR = CreateObject(sk.SKReplyLib, interface=sk.ISKReplyLib)
+
 
 class QuoteReceiver():
     """
@@ -25,6 +28,7 @@ class QuoteReceiver():
       * 4-1 SKCenterLib (p.18)
       * 4-4 SKQuoteLib (p.93)
     """
+
     # pylint: disable=too-many-instance-attributes
 
     def __init__(self, gui_mode=False):
@@ -35,8 +39,8 @@ class QuoteReceiver():
 
         # 接收器設定屬性
         self.gui_mode = gui_mode
-        self.log_path = os.path.expanduser(r'~\.skcom\logs\capital')
-        self.dst_conf = os.path.expanduser(r'~\.skcom\skcom.json')
+        self.log_path = os.path.expanduser('~\\.skcom\\logs')
+        self.dst_conf = os.path.expanduser('~\\.skcom\\skcom.json')
 
         # Ticks 處理用屬性
         self.ticks_hook = None
@@ -51,18 +55,20 @@ class QuoteReceiver():
         self.kline_days_limit = 20
         self.kline_last_mtime = 0
 
+        # 處裡最佳五
+        self.best5 = None
+
         self.skc = None
         self.skq = None
-        self.logger = logging.getLogger('skcom')
-
-        # 產生 log 目錄
-        if not os.path.isdir(self.log_path):
-            os.makedirs(self.log_path)
 
         valid_config = False
+        tpl_conf = os.path.dirname(os.path.realpath(__file__)) + '\\conf\\skcom.json'
+
         if not os.path.isfile(self.dst_conf):
+            # 產生 log 目錄
+            if not os.path.isdir(self.log_path):
+                os.makedirs(self.log_path)
             # 複製設定檔範本
-            tpl_conf = os.path.dirname(os.path.realpath(__file__)) + r'\conf\skcom.json'
             shutil.copy(tpl_conf, self.dst_conf)
         else:
             # 載入設定檔
@@ -78,8 +84,9 @@ class QuoteReceiver():
         """
         設定檔使用提示
         """
-        self.logger.info('請開啟設定檔，將帳號密碼改為您的證券帳號')
-        self.logger.info('設定檔路徑: %s', self.dst_conf)
+        # 提示
+        print('請開啟設定檔，將帳號密碼改為您的證券帳號')
+        print('設定檔路徑: ' + self.dst_conf)
         exit(0)
 
     def ctrl_c(self, sig, frm):
@@ -88,7 +95,7 @@ class QuoteReceiver():
         """
         # pylint: disable=unused-argument
         if not self.done and not self.stopping:
-            self.logger.info('偵測到 Ctrl+C, 結束監聽')
+            print('偵測到 Ctrl+C, 結束監聽')
             self.stop()
 
     def set_kline_hook(self, hook, days_limit=20):
@@ -105,52 +112,57 @@ class QuoteReceiver():
         self.ticks_hook = hook
         self.ticks_include_history = include_history
 
+    def set_best5(self, hook):
+        self.hook = hook
+
     def start(self):
         """
         開始接收報價
         """
         # pylint: disable=too-many-branches,too-many-nested-blocks,too-many-statements
 
-        if self.ticks_hook is None and self.kline_hook is None:
-            self.logger.info('沒有設定監聽項目')
+        if self.ticks_hook is None and self.kline_hook is None and self.best5:
+            print('沒有設定監聽項目')
             return
 
         try:
             signal.signal(signal.SIGINT, self.ctrl_c)
 
             # 登入
-            self.skc = comtypes.client.CreateObject(sk.SKCenterLib, interface=sk.ISKCenterLib) # pylint: disable=invalid-name, no-member
+            self.skc = comtypes.client.CreateObject(sk.SKCenterLib,
+                                                    interface=sk.ISKCenterLib)  # pylint: disable=invalid-name, no-member
             self.skc.SKCenterLib_SetLogPath(self.log_path)
             n_code = self.skc.SKCenterLib_Login(self.config['account'], self.config['password'])
             if n_code != 0:
                 # 沒插網路線會回傳 1001, 不會觸發 OnConnection
                 self.handle_sk_error('Login()', n_code)
                 return
-            self.logger.info('登入成功')
+            print('登入成功')
 
             # 建立報價連線
             # 注意: comtypes.client.GetEvents() 有雷
             # * 一定要收回傳值, 即使這個回傳值沒用到, 如果不收回傳值會導致事件收不到
             # * 指定給 self.skH 會在程式結束時產生例外
             # * 指定給 global skH 會在程式結束時產生例外
-            self.skq = comtypes.client.CreateObject(sk.SKQuoteLib, interface=sk.ISKQuoteLib) # pylint: disable=invalid-name, no-member
-            skh = comtypes.client.GetEvents(self.skq, self) # pylint: disable=unused-variable
+            self.skq = comtypes.client.CreateObject(sk.SKQuoteLib,
+                                                    interface=sk.ISKQuoteLib)  # pylint: disable=invalid-name, no-member
+            skh = comtypes.client.GetEvents(self.skq, self)  # pylint: disable=unused-variable
             n_code = self.skq.SKQuoteLib_EnterMonitor()
             if n_code != 0:
                 # 這裡拔網路線會得到 3022, 查表沒有對應訊息
                 self.handle_sk_error('EnterMonitor()', n_code)
                 return
-            self.logger.info('連線成功')
+            print('連線成功')
 
             # 等待連線就緒
             while not self.ready and not self.done:
                 time.sleep(1)
                 if not self.gui_mode:
-                    pythoncom.PumpWaitingMessages() # pylint: disable=no-member
+                    pythoncom.PumpWaitingMessages()  # pylint: disable=no-member
 
             if self.done:
                 return
-            self.logger.info('連線就緒')
+            print('連線就緒')
 
             # 這時候拔網路線疑似會陷入無窮迴圈
             # time.sleep(3)
@@ -168,12 +180,12 @@ class QuoteReceiver():
                         #    因為這樣, 實際上可能可以突破只能聽 50 檔的限制, 不過暫時先照文件友善使用 API
                         # 3. 參數 psPageNo 指定 -1 會自動分配 page, page 介於 0-49, 與 stock page 不同
                         # 4. 參數 psPageNo 指定 50 會取消報價
-                        (page_no, n_code) = self.skq.SKQuoteLib_RequestTicks(-1, stock_no) # pylint: disable=unused-variable
+                        (page_no, n_code) = self.skq.SKQuoteLib_RequestTicks(-1,
+                                                                             stock_no)  # pylint: disable=unused-variable
                         # self.logger.info('tick page=%d' % pageNo)
                         if n_code != 0:
                             self.handle_sk_error('RequestTicks()', n_code)
                     # self.logger.info('Ticks 請求完成')
-
             # 接收日 K
             if self.kline_hook is not None:
                 # 取樣截止日
@@ -203,18 +215,18 @@ class QuoteReceiver():
                         'name': p_stock.bstrStockName,
                         'quotes': []
                     }
-                self.logger.info('股票名稱載入完成')
+                print('股票名稱載入完成')
 
                 # 請求日 K
                 for stock_no in self.config['products']:
                     # 參考文件: 4-4-9 (p.99), 4-4-21 (p.105)
                     # 1. 使用方式與文件相符
                     # 2. 台股日 K 使用全盤與 AM 盤效果相同
-                    n_code = self.skq.SKQuoteLib_RequestKLine(stock_no, 4, 1)
-                    # n_code = self.skq.SKQuoteLib_RequestKLineAM(stock_no, 4, 1, 1)
+                    # n_code = self.skq.SKQuoteLib_RequestKLineAM(stock_no, 4, 1)
+                    n_code = self.skq.SKQuoteLib_RequestKLineAM(stock_no, 4, 1, 1)
                     if n_code != 0:
                         self.handle_sk_error('RequestKLine()', n_code)
-                self.logger.info('日 K 請求完成')
+                print('日 K 請求完成')
 
             # 命令模式下等待 Ctrl+C
             if not self.gui_mode:
@@ -225,13 +237,13 @@ class QuoteReceiver():
                             for stock_id in self.daily_kline:
                                 self.kline_hook(self.daily_kline[stock_id])
                             self.daily_kline = None
-                    pythoncom.PumpWaitingMessages() # pylint: disable=no-member
+                    pythoncom.PumpWaitingMessages()  # pylint: disable=no-member
                     time.sleep(0.5)
 
-            self.logger.info('監聽結束')
+            print('監聽結束')
         except COMError as ex:
-            self.logger.error('init() 發生不預期狀況')
-            self.logger.error(ex)
+            print('init() 發生不預期狀況', flush=True)
+            print(ex)
         # TODO: 需要再補充其他類型的例外
 
     def stop(self):
@@ -252,9 +264,10 @@ class QuoteReceiver():
         """
         # 參考文件: 4-1-3 (p.19)
         skmsg = self.skc.SKCenterLib_GetReturnCodeMessage(n_code)
-        self.logger.error('執行動作 [%s] 時發生錯誤, 詳細原因: %s', action, skmsg)
+        msg = '執行動作 [%s] 時發生錯誤, 詳細原因: %s' % (action, skmsg)
+        print(msg)
 
-    def handle_ticks(self, stock_id, name, timestr, bid, ask, close, qty, vol): # pylint: disable=too-many-arguments
+    def handle_ticks(self, stock_id, name, timestr, bid, ask, close, qty, vol):  # pylint: disable=too-many-arguments
         """
         處理當天回補 ticks 或即時 ticks
         """
@@ -289,16 +302,13 @@ class QuoteReceiver():
         # 3021 異常斷線
         if nKind == 3003:
             self.ready = True
-        if nKind == 3002:
+        if nKind in (3002, 3021):
             self.done = True
-            self.logger.info('結束連線')
-        if nKind == 3021:
-            self.done = True
-            self.logger.error('異常斷線')
+            print('斷線')
 
     def OnNotifyHistoryTicks(self, sMarketNo, sStockidx, nPtr, \
-                      nDate, nTimehms, nTimemillis, \
-                      nBid, nAsk, nClose, nQty, nSimulate):
+                             nDate, nTimehms, nTimemillis, \
+                             nBid, nAsk, nClose, nQty, nSimulate):
         """
         接收當天回補撮合 Ticks 4-4-c (p.108)
         """
@@ -335,7 +345,7 @@ class QuoteReceiver():
             mmdec = nTimehms % 100
             nTimehms /= 100
             hhdec = nTimehms
-            timestr = '%02d:%02d:%02d.%03d' % (hhdec, mmdec, ssdec, nTimemillis//1000)
+            timestr = '%02d:%02d:%02d.%03d' % (hhdec, mmdec, ssdec, nTimemillis // 1000)
 
             # 格式轉換
             ppow = math.pow(10, p_stock.sDecimal)
@@ -347,7 +357,7 @@ class QuoteReceiver():
                 nAsk / ppow,
                 nClose / ppow,
                 nQty,
-                self.ticks_total[p_stock.bstrStockNo] # p_stock.nTQty
+                self.ticks_total[p_stock.bstrStockNo]  # p_stock.nTQty
             )
 
     def OnNotifyTicks(self, sMarketNo, sStockidx, nPtr, \
@@ -389,7 +399,7 @@ class QuoteReceiver():
         mmdec = nTimehms % 100
         nTimehms /= 100
         hhdec = nTimehms
-        timestr = '%02d:%02d:%02d.%03d' % (hhdec, mmdec, ssdec, nTimemillis//1000)
+        timestr = '%02d:%02d:%02d.%03d' % (hhdec, mmdec, ssdec, nTimemillis // 1000)
 
         # 格式轉換
         ppow = math.pow(10, p_stock.sDecimal)
@@ -404,7 +414,7 @@ class QuoteReceiver():
             self.ticks_total[p_stock.bstrStockNo]
         )
 
-    def OnNotifyKLineData(self, bstrStockNo, bstrData):
+    def OnNotifyKLineData(self, bstrStockNo, bstrData, ):
         """
         接收 K 線資料 (文件 4-4-f p.112)
         """
@@ -415,9 +425,10 @@ class QuoteReceiver():
         # 日期        開           高          低          收          量
         # 2019/05/21, 233.500000, 236.000000, 232.500000, 234.000000, 79971
         cols = bstrData.split(', ')
+        # print(cols)
         this_date = cols[0].replace('/', '-')
         self.kline_last_mtime = time.time()
-        # self.logger.info('%s %.5f' % (this_date, self.kline_last_mtime))
+        # print('%s %.5f' % (this_date, self.kline_last_mtime))
 
         if self.daily_kline[bstrStockNo] is not None:
             # 寫入緩衝區與交易日數限制處理
@@ -434,14 +445,58 @@ class QuoteReceiver():
             if self.kline_days_limit > 0 and len(buffer) > self.kline_days_limit:
                 buffer.pop(0)
 
-            # 取得最後一筆後觸發 hook, 並且清除緩衝區
-            #if this_date == self.end_date:
-            #    self.kline_hook(self.daily_kline[bstrStockNo])
-            #    self.daily_kline[bstrStockNo] = None
+    def OnNotifyBest5(self, sMarketNo, sStockidx, nBestBid1, nBestBidQty1, nBestBid2, nBestBidQty2, nBestBid3,
+                      nBestBidQty3, nBestBid4, nBestBidQty4, nBestBid5, nBestBidQty5, nExtendBid,
+                      nExtendBidQty, nBestAsk1, nBestAskQty1, nBestAsk2, nBestAskQty2, nBestAsk3, nBestAskQty3,
+                      nBestAsk4, nBestAskQty4, nBestAsk5, nBestAskQty5, nExtendAsk, nExtendAskQty, nSimulate):
+        # 參考API 文檔P122 取的最佳五
+        best5 = {
+            'BestBid1': nBestBid1,
+            'BestQty1': nBestBidQty1,
+            'BestBid2': nBestBid2,
+            'BestQty2': nBestBidQty2,
+            'BestBid3': nBestBid3,
+            'BestQty3': nBestBidQty3,
+            'BestBid4': nBestBid4,
+            'BestQty4': nBestBidQty4,
+            'BestBid5': nBestBid5,
+            'BestQty5': nBestBidQty5,
+            'BsetAsk1': nBestAsk1,
+            'BestAskQty1': nBestAskQty1,
+            'BsetAsk2': nBestAsk2,
+            'BestAskQty2': nBestAskQty2,
+            'BsetAsk3': nBestAsk3,
+            'BestAskQty3': nBestAskQty3,
+            'BsetAsk4': nBestAsk4,
+            'BestAskQty4': nBestAskQty4,
+            'BsetAsk5': nBestAsk5,
+            'BestAskQty5': nBestAskQty5}
+        print(best5)  # 已經寫成字典問題是如何像前面那樣做回傳的動作呢??~
 
-        # 除錯用, 確認當日資料產生時機後就刪除
-        # 14:00, kline 會收到昨天
-        # 14:30, 待確認
-        # 15:00, kline 會收到當天
-        #if this_date > self.end_date:
-        #    self.logger.info('當日資料已產生', this_date)
+    def GetOverseaFutures(self):
+        return
+
+    def OnOverseaFuture(self, bstrData):
+        print(bstrData)
+
+# 取得最後一筆後觸發 hook, 並且清除緩衝區
+# if this_date == self.end_date:~
+#    self.kline_hook(self.daily_kline[bstrStockNo])
+#    self.daily_kline[bstrStockNo] = None
+
+# 除錯用, 確認當日資料產生時機後就刪除
+# 14:00, kline 會收到昨天
+# 14:30, 待確認
+# 15:00, kline 會收到當天
+# if this_date > self.end_date:
+#    print('當日資料已產生', this_date)
+# class skR_events:
+# 最新版API 需要這個
+#     def OnReplyMessage(self, bstrUserID, bstrMessage, sConfirmCode=0xFFFF):
+#         #根據API 手冊，login 前會先檢查這個 callback,
+#         #要返回 VARIANT_TRUE 給 server,  表示看過公告了，我預設返回值是 0xFFFF
+#         print('OnReplyMessage', bstrUserID, bstrMessage)
+#         return sConfirmCode
+# EventR=skR_events()
+#
+# ConnR = comtypes.client.GetEvents(skR, EventR)
